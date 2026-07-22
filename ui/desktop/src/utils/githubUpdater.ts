@@ -305,7 +305,7 @@ export class GitHubUpdater {
       await fs.mkdir(extractDir, { recursive: true });
 
       log.info(`GitHubUpdater: Extracting ${downloadPath} to ${extractDir}...`);
-      await this.runCommand('ditto', ['-x', '-k', downloadPath, extractDir]);
+      await this.runDitto(['-x', '-k', downloadPath, extractDir]);
 
       const entries = await fs.readdir(extractDir);
       const appEntry = entries.find((e) => e.endsWith('.app'));
@@ -356,15 +356,15 @@ rm -rf "${stagingDir}"
     }
   }
 
-  private runCommand(command: string, args: string[]): Promise<void> {
+  private runDitto(args: string[]): Promise<void> {
     return new Promise((resolve, reject) => {
-      const child = spawn(command, args, { stdio: 'ignore' });
+      const child = spawn('ditto', args, { stdio: 'ignore' });
       child.on('error', reject);
       child.on('close', (code) => {
         if (code === 0) {
           resolve();
         } else {
-          reject(new Error(`${command} exited with code ${code}`));
+          reject(new Error(`ditto exited with code ${code}`));
         }
       });
     });
