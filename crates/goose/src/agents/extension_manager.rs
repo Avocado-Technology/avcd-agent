@@ -1387,7 +1387,9 @@ impl ExtensionManager {
     }
 
     pub async fn list_extensions(&self) -> ExtensionResult<Vec<String>> {
-        Ok(self.extensions.lock().await.keys().cloned().collect())
+        let mut names: Vec<String> = self.extensions.lock().await.keys().cloned().collect();
+        names.extend(self.deferred_extensions.lock().await.keys().cloned());
+        Ok(names)
     }
 
     pub async fn is_extension_enabled(&self, name: &str) -> bool {
@@ -3736,6 +3738,11 @@ mod tests {
         assert_eq!(
             extension_manager.get_extension_configs().await,
             vec![config]
+        );
+        assert_eq!(
+            extension_manager.list_extensions().await.unwrap(),
+            vec!["deferred_ext".to_string()],
+            "the extension listing must agree with enablement checks"
         );
 
         extension_manager
