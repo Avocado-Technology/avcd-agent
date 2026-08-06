@@ -976,15 +976,45 @@ impl ExtensionManager {
             .await
     }
 
-    async fn should_defer_local_spawn(&self, config: &ExtensionConfig) -> bool {
-        if !matches!(
+    fn is_forwardable(config: &ExtensionConfig) -> bool {
+        matches!(
             config,
             ExtensionConfig::Stdio { .. } | ExtensionConfig::StreamableHttp { .. }
-        ) {
+        )
+    }
+
+    async fn should_defer_local_spawn(&self, config: &ExtensionConfig) -> bool {
+        if !Self::is_forwardable(config) {
             return false;
         }
         let provider = self.provider.lock().await.clone();
         provider.is_some_and(|provider| provider.forwards_extensions_downstream())
+    }
+
+    /// Shut down local MCP clients for extensions that the session's provider
+    /// runs in a downstream session, keeping their configs deferred so
+    /// goose-side consumers can respawn them on demand. Called on a switch to
+    /// a forwarding provider so local clients don't duplicate the downstream
+    /// harness's own instances.
+    pub async fn defer_forwardable_extensions(&self) {
+        let mut extensions = self.extensions.lock().await;
+        let keys: Vec<String> = extensions
+            .iter()
+            .filter(|(_, extension)| Self::is_forwardable(&extension.config))
+            .map(|(key, _)| key.clone())
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred_extensions.lock().await;
+        for key in keys {
+            if let Some(extension) = extensions.remove(&key) {
+                deferred.insert(key, extension.config);
+            }
+        }
+        drop(deferred);
+        drop(extensions);
+        self.invalidate_tools_cache_and_bump_version().await;
     }
 
     /// Spawn extensions whose local start was deferred because the session's
@@ -2253,6 +2283,17 @@ impl ExtensionManager {
             .lock()
             .await
             .insert(config.key(), config);
+    }
+
+    pub(crate) async fn insert_extension_for_tests(
+        &self,
+        config: ExtensionConfig,
+        client: McpClientBox,
+    ) {
+        let key = config.key();
+        let extension = Extension::new(config.clone(), config, client, None, None);
+        self.extensions.lock().await.insert(key, extension);
+        self.invalidate_tools_cache_and_bump_version().await;
     }
 }
 
@@ -3753,5 +3794,41 @@ mod tests {
             extension_manager.has_deferred_extensions().await,
             "failed spawns should stay deferred so a later consumer can retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_defer_forwardable_extensions_redefers_stdio_and_keeps_builtin() {
+        let temp_dir = tempdir().unwrap();
+        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
+            temp_dir.path().to_path_buf(),
+        ));
+
+        let stdio_config =
+            ExtensionConfig::stdio("local_ext", "some-command", "test extension", 5u64);
+        extension_manager
+            .insert_extension_for_tests(stdio_config.clone(), Arc::new(MockClient {}))
+            .await;
+        extension_manager
+            .add_mock_extension("builtin_ext".to_string(), Arc::new(MockClient {}))
+            .await;
+
+        extension_manager.defer_forwardable_extensions().await;
+
+        let extensions = extension_manager.extensions.lock().await;
+        assert!(
+            !extensions.contains_key("local_ext"),
+            "the local stdio client must be shut down"
+        );
+        assert!(
+            extensions.contains_key("builtin_ext"),
+            "in-process extensions must keep running"
+        );
+        drop(extensions);
+        assert!(extension_manager.has_deferred_extensions().await);
+        assert!(extension_manager.is_extension_enabled("local_ext").await);
+        assert!(extension_manager
+            .get_extension_configs()
+            .await
+            .contains(&stdio_config));
     }
 }

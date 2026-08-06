@@ -3243,7 +3243,9 @@ impl Agent {
         *current_provider = Some(provider);
         drop(current_provider);
 
-        if !forwards_extensions_downstream {
+        if forwards_extensions_downstream {
+            self.extension_manager.defer_forwardable_extensions().await;
+        } else {
             self.start_deferred_extensions(session_id).await;
         }
 
@@ -4980,6 +4982,89 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             bundled: None,
             available_tools: vec![],
         }
+    }
+
+    struct ForwardingProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for ForwardingProvider {
+        fn get_name(&self) -> &str {
+            "forwarding-mock"
+        }
+
+        async fn stream(
+            &self,
+            _: &goose_providers::model::ModelConfig,
+            _: &str,
+            _: &[Message],
+            _: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            unimplemented!("not used in this test")
+        }
+
+        fn forwards_extensions_downstream(&self) -> bool {
+            true
+        }
+    }
+
+    struct StubMcpClient;
+
+    #[async_trait::async_trait]
+    impl crate::agents::mcp_client::McpClientTrait for StubMcpClient {
+        fn get_info(&self) -> Option<&rmcp::model::InitializeResult> {
+            None
+        }
+
+        async fn list_tools(
+            &self,
+            _: &str,
+            _: Option<String>,
+            _: CancellationToken,
+        ) -> Result<rmcp::model::ListToolsResult, rmcp::ServiceError> {
+            Ok(rmcp::model::ListToolsResult::default())
+        }
+
+        async fn call_tool(
+            &self,
+            _: &crate::agents::tool_execution::ToolCallContext,
+            _: &str,
+            _: Option<rmcp::model::JsonObject>,
+            _: CancellationToken,
+        ) -> Result<CallToolResult, rmcp::ServiceError> {
+            Err(rmcp::ServiceError::TransportClosed)
+        }
+    }
+
+    #[tokio::test]
+    async fn update_provider_to_forwarding_provider_redefers_local_extensions() {
+        let (agent, session, _data_dir) = tracing_test_agent_and_session().await;
+        let config = ExtensionConfig::stdio("local_ext", "some-command", "test extension", 5u64);
+        agent
+            .extension_manager
+            .insert_extension_for_tests(config, Arc::new(StubMcpClient))
+            .await;
+        assert!(!agent.extension_manager.has_deferred_extensions().await);
+
+        agent
+            .update_provider(
+                Arc::new(ForwardingProvider),
+                goose_providers::model::ModelConfig::new("mock-model"),
+                &session.id,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            agent.extension_manager.has_deferred_extensions().await,
+            "switching to a forwarding provider must re-defer local stdio extensions"
+        );
+        assert!(
+            agent
+                .extension_manager
+                .is_extension_enabled("local_ext")
+                .await,
+            "a re-deferred extension stays part of the session's extension set"
+        );
     }
 
     #[tokio::test]
