@@ -487,6 +487,10 @@ impl Provider for AcpProvider {
         true
     }
 
+    fn forwards_extensions_downstream(&self) -> bool {
+        true
+    }
+
     fn set_session_title_callback(&self, callback: Arc<dyn Fn(String) + Send + Sync>) {
         self.session_title_publisher.set_callback(callback);
     }

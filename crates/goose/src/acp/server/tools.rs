@@ -12,6 +12,7 @@ impl GooseAcpAgent {
     ) -> Result<GetToolsResponse, agent_client_protocol::Error> {
         let session_id = &req.session_id;
         let agent = self.get_session_agent(&req.session_id).await?;
+        agent.start_deferred_extensions(session_id).await;
         let goose_mode = agent.goose_mode().await;
         let permission_manager = self.permission_manager();
 
@@ -63,6 +64,7 @@ impl GooseAcpAgent {
     ) -> Result<GooseToolCallResponse, agent_client_protocol::Error> {
         let session_id = &req.session_id;
         let agent = self.get_session_agent(&req.session_id).await?;
+        agent.start_deferred_extensions(session_id).await;
         let tools = agent.list_tools(session_id, None).await;
 
         let Some(tool) = tools.iter().find(|t| *t.name == req.name) else {

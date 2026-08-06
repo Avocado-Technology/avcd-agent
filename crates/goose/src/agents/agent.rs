@@ -1555,6 +1555,27 @@ impl Agent {
         prefixed_tools
     }
 
+    /// Spawn any session extensions whose local start was deferred because
+    /// the provider runs them in a downstream session (see
+    /// `Provider::forwards_extensions_downstream`). Used by surfaces that
+    /// serve goose-side tools and resources to clients.
+    pub async fn start_deferred_extensions(&self, session_id: &str) {
+        if !self.extension_manager.has_deferred_extensions().await {
+            return;
+        }
+        let working_dir = self
+            .config
+            .session_manager
+            .get_session(session_id, false)
+            .await
+            .ok()
+            .map(|session| session.working_dir);
+        let container = self.container.lock().await.clone();
+        self.extension_manager
+            .start_deferred_extensions(working_dir, container.as_ref(), Some(session_id))
+            .await;
+    }
+
     pub async fn remove_extension(&self, name: &str, session_id: &str) -> Result<()> {
         self.extension_manager.remove_extension(name).await?;
         self.remove_frontend_extension(name).await;
@@ -3217,8 +3238,14 @@ impl Agent {
             Err(_) => model_config,
         };
 
+        let forwards_extensions_downstream = provider.forwards_extensions_downstream();
         let mut current_provider = self.provider.lock().await;
         *current_provider = Some(provider);
+        drop(current_provider);
+
+        if !forwards_extensions_downstream {
+            self.start_deferred_extensions(session_id).await;
+        }
 
         self.config
             .session_manager

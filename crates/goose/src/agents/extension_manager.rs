@@ -188,6 +188,10 @@ pub(crate) const TRUSTED_TOOL_UPDATE_META_KEY: &str = "__goose_tool_update_meta"
 /// Manages goose extensions / MCP clients and their interactions
 pub struct ExtensionManager {
     extensions: Mutex<HashMap<String, Extension>>,
+    /// Extensions that are part of the session's extension set but whose
+    /// local MCP client was not spawned because the provider runs them in a
+    /// downstream session. See `add_extension`.
+    deferred_extensions: Mutex<HashMap<String, ExtensionConfig>>,
     context: PlatformExtensionContext,
     provider: SharedProvider,
     tools_cache: Mutex<Option<Arc<Vec<Tool>>>>,
@@ -899,6 +903,7 @@ impl ExtensionManager {
     ) -> Self {
         Self {
             extensions: Mutex::new(HashMap::new()),
+            deferred_extensions: Mutex::new(HashMap::new()),
             context: PlatformExtensionContext {
                 extension_manager: None,
                 session_manager,
@@ -945,8 +950,72 @@ impl ExtensionManager {
 
     /// Add an extension with an optional working directory.
     /// If working_dir is None, falls back to current_dir.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// When the session's provider forwards extensions to a downstream session
+    /// (see `Provider::forwards_extensions_downstream`), stdio and
+    /// streamable-HTTP extensions are not spawned locally: the downstream
+    /// harness runs its own instances and goose-side tools are never shown to
+    /// the model. The config is kept as deferred so it stays part of the
+    /// session's extension set and can be spawned later via
+    /// `start_deferred_extensions`.
     pub async fn add_extension(
+        self: &Arc<Self>,
+        config: ExtensionConfig,
+        working_dir: Option<PathBuf>,
+        container: Option<&Container>,
+        session_id: Option<&str>,
+    ) -> ExtensionResult<()> {
+        if self.should_defer_local_spawn(&config).await {
+            let key = config.key();
+            if !self.extensions.lock().await.contains_key(&key) {
+                self.deferred_extensions.lock().await.insert(key, config);
+                return Ok(());
+            }
+        }
+        self.spawn_extension(config, working_dir, container, session_id)
+            .await
+    }
+
+    async fn should_defer_local_spawn(&self, config: &ExtensionConfig) -> bool {
+        if !matches!(
+            config,
+            ExtensionConfig::Stdio { .. } | ExtensionConfig::StreamableHttp { .. }
+        ) {
+            return false;
+        }
+        let provider = self.provider.lock().await.clone();
+        provider.is_some_and(|provider| provider.forwards_extensions_downstream())
+    }
+
+    /// Spawn extensions whose local start was deferred because the session's
+    /// provider runs them in a downstream session. Called when a goose-side
+    /// consumer (client tool listing/calls, resources, apps, or a switch to a
+    /// provider that dispatches tools through goose) needs local instances.
+    pub async fn start_deferred_extensions(
+        self: &Arc<Self>,
+        working_dir: Option<PathBuf>,
+        container: Option<&Container>,
+        session_id: Option<&str>,
+    ) {
+        let deferred: Vec<(String, ExtensionConfig)> =
+            self.deferred_extensions.lock().await.drain().collect();
+        for (key, config) in deferred {
+            if let Err(error) = self
+                .spawn_extension(config.clone(), working_dir.clone(), container, session_id)
+                .await
+            {
+                tracing::warn!(extension = %key, %error, "failed to start deferred extension");
+                self.deferred_extensions.lock().await.insert(key, config);
+            }
+        }
+    }
+
+    pub async fn has_deferred_extensions(&self) -> bool {
+        !self.deferred_extensions.lock().await.is_empty()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn spawn_extension(
         self: &Arc<Self>,
         config: ExtensionConfig,
         working_dir: Option<PathBuf>,
@@ -1198,6 +1267,10 @@ impl ExtensionManager {
 
         let server_info = client.get_info().cloned();
 
+        self.deferred_extensions
+            .lock()
+            .await
+            .remove(&sanitized_name);
         let mut extensions = self.extensions.lock().await;
         extensions.insert(
             sanitized_name,
@@ -1250,6 +1323,10 @@ impl ExtensionManager {
     pub async fn remove_extension(&self, name: &str) -> ExtensionResult<()> {
         let sanitized_name = name_to_key(name);
         self.extensions.lock().await.remove(&sanitized_name);
+        self.deferred_extensions
+            .lock()
+            .await
+            .remove(&sanitized_name);
         self.invalidate_tools_cache_and_bump_version().await;
         Ok(())
     }
@@ -1282,15 +1359,23 @@ impl ExtensionManager {
     pub async fn is_extension_enabled(&self, name: &str) -> bool {
         let normalized = name_to_key(name);
         self.extensions.lock().await.contains_key(&normalized)
+            || self
+                .deferred_extensions
+                .lock()
+                .await
+                .contains_key(&normalized)
     }
 
     pub async fn get_extension_configs(&self) -> Vec<ExtensionConfig> {
-        self.extensions
+        let mut configs: Vec<ExtensionConfig> = self
+            .extensions
             .lock()
             .await
             .values()
             .map(|ext| ext.config.clone())
-            .collect()
+            .collect();
+        configs.extend(self.deferred_extensions.lock().await.values().cloned());
+        configs
     }
 
     /// Get all tools from all clients with proper prefixing
@@ -3538,6 +3623,125 @@ mod tests {
         assert!(
             header_found,
             "custom header x-api-key was not forwarded through the OAuth connection path"
+        );
+    }
+
+    struct ForwardingProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::base::Provider for ForwardingProvider {
+        fn get_name(&self) -> &str {
+            "forwarding-mock"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[crate::conversation::message::Message],
+            _tools: &[Tool],
+        ) -> Result<crate::providers::base::MessageStream, goose_providers::errors::ProviderError>
+        {
+            Err(goose_providers::errors::ProviderError::ExecutionError(
+                "not used in this test".to_string(),
+            ))
+        }
+
+        fn forwards_extensions_downstream(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stdio_extension_deferred_for_forwarding_provider() {
+        let temp_dir = tempdir().unwrap();
+        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
+            temp_dir.path().to_path_buf(),
+        ));
+        *extension_manager.provider.lock().await = Some(Arc::new(ForwardingProvider));
+
+        let config = ExtensionConfig::stdio(
+            "deferred_ext",
+            "nonexistent-binary-for-deferral-test",
+            "test extension",
+            5u64,
+        );
+
+        extension_manager
+            .add_extension(config.clone(), None, None, None)
+            .await
+            .expect("deferred add should not spawn and should succeed");
+
+        assert!(
+            extension_manager.extensions.lock().await.is_empty(),
+            "no local MCP client should be spawned for a forwarding provider"
+        );
+        assert!(extension_manager.has_deferred_extensions().await);
+        assert!(extension_manager.is_extension_enabled("deferred_ext").await);
+        assert_eq!(
+            extension_manager.get_extension_configs().await,
+            vec![config]
+        );
+
+        extension_manager
+            .remove_extension("deferred_ext")
+            .await
+            .unwrap();
+        assert!(!extension_manager.has_deferred_extensions().await);
+        assert!(!extension_manager.is_extension_enabled("deferred_ext").await);
+        assert!(extension_manager.get_extension_configs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_builtin_extension_not_deferred_for_forwarding_provider() {
+        let temp_dir = tempdir().unwrap();
+        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
+            temp_dir.path().to_path_buf(),
+        ));
+        *extension_manager.provider.lock().await = Some(Arc::new(ForwardingProvider));
+
+        let config = ExtensionConfig::Builtin {
+            name: "todo".to_string(),
+            display_name: None,
+            description: "built-in".to_string(),
+            timeout: None,
+            bundled: None,
+            available_tools: vec![],
+        };
+        assert!(!extension_manager.should_defer_local_spawn(&config).await);
+    }
+
+    #[tokio::test]
+    async fn test_start_deferred_extensions_attempts_spawn_and_keeps_failed() {
+        let temp_dir = tempdir().unwrap();
+        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
+            temp_dir.path().to_path_buf(),
+        ));
+        *extension_manager.provider.lock().await = Some(Arc::new(ForwardingProvider));
+
+        let config = ExtensionConfig::stdio(
+            "deferred_ext",
+            "nonexistent-binary-for-deferral-test",
+            "test extension",
+            5u64,
+        );
+        extension_manager
+            .add_extension(config, None, None, None)
+            .await
+            .unwrap();
+        assert!(extension_manager.has_deferred_extensions().await);
+
+        extension_manager
+            .start_deferred_extensions(None, None, None)
+            .await;
+
+        assert!(
+            extension_manager.extensions.lock().await.is_empty(),
+            "spawn of a nonexistent binary must not register an extension"
+        );
+        assert!(
+            extension_manager.has_deferred_extensions().await,
+            "failed spawns should stay deferred so a later consumer can retry"
         );
     }
 }
