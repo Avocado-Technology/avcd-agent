@@ -2247,6 +2247,16 @@ impl ExtensionManager {
 }
 
 #[cfg(test)]
+impl ExtensionManager {
+    pub(crate) async fn defer_extension_for_tests(&self, config: ExtensionConfig) {
+        self.deferred_extensions
+            .lock()
+            .await
+            .insert(config.key(), config);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rmcp::model::CallToolResult;

@@ -1558,7 +1558,7 @@ impl Agent {
     /// Spawn any session extensions whose local start was deferred because
     /// the provider runs them in a downstream session (see
     /// `Provider::forwards_extensions_downstream`). Used by surfaces that
-    /// serve goose-side tools and resources to clients.
+    /// serve goose-side tools, prompts, and resources to clients.
     pub async fn start_deferred_extensions(&self, session_id: &str) {
         if !self.extension_manager.has_deferred_extensions().await {
             return;
@@ -3467,6 +3467,7 @@ impl Agent {
     }
 
     pub async fn list_extension_prompts(&self, session_id: &str) -> HashMap<String, Vec<Prompt>> {
+        self.start_deferred_extensions(session_id).await;
         self.extension_manager
             .list_prompts(session_id, CancellationToken::default())
             .await
@@ -3479,6 +3480,7 @@ impl Agent {
         name: &str,
         arguments: Value,
     ) -> Result<GetPromptResult> {
+        self.start_deferred_extensions(session_id).await;
         // First find which extension has this prompt
         let prompts = self
             .extension_manager
@@ -4968,5 +4970,50 @@ echo start >> "$PLUGIN_ROOT/hook.log"
             .expect("usage must remain stored on the hidden assistant message");
         assert_eq!(stored.input_tokens, Some(1200));
         assert_eq!(stored.output_tokens, Some(340));
+    }
+
+    fn deferred_platform_config() -> ExtensionConfig {
+        ExtensionConfig::Platform {
+            name: "todo".to_string(),
+            description: "todo".to_string(),
+            display_name: None,
+            bundled: None,
+            available_tools: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn list_extension_prompts_starts_deferred_extensions() {
+        let (agent, session, _data_dir) = tracing_test_agent_and_session().await;
+        agent
+            .extension_manager
+            .defer_extension_for_tests(deferred_platform_config())
+            .await;
+
+        agent.list_extension_prompts(&session.id).await;
+
+        assert!(
+            !agent.extension_manager.has_deferred_extensions().await,
+            "listing prompts must start deferred extensions"
+        );
+        assert!(agent.list_extensions().await.contains(&"todo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_prompt_starts_deferred_extensions() {
+        let (agent, session, _data_dir) = tracing_test_agent_and_session().await;
+        agent
+            .extension_manager
+            .defer_extension_for_tests(deferred_platform_config())
+            .await;
+
+        let _ = agent
+            .get_prompt(&session.id, "missing-prompt", Value::Null)
+            .await;
+
+        assert!(
+            !agent.extension_manager.has_deferred_extensions().await,
+            "fetching a prompt must start deferred extensions"
+        );
     }
 }
