@@ -1029,15 +1029,19 @@ impl ExtensionManager {
     ) {
         let deferred: Vec<(String, ExtensionConfig)> =
             self.deferred_extensions.lock().await.drain().collect();
-        for (key, config) in deferred {
-            if let Err(error) = self
-                .spawn_extension(config.clone(), working_dir.clone(), container, session_id)
-                .await
-            {
-                tracing::warn!(extension = %key, %error, "failed to start deferred extension");
-                self.deferred_extensions.lock().await.insert(key, config);
+        let spawns = deferred.into_iter().map(|(key, config)| {
+            let working_dir = working_dir.clone();
+            async move {
+                if let Err(error) = self
+                    .spawn_extension(config.clone(), working_dir, container, session_id)
+                    .await
+                {
+                    tracing::warn!(extension = %key, %error, "failed to start deferred extension");
+                    self.deferred_extensions.lock().await.insert(key, config);
+                }
             }
-        }
+        });
+        futures::future::join_all(spawns).await;
     }
 
     pub async fn has_deferred_extensions(&self) -> bool {
