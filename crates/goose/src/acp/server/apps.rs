@@ -23,7 +23,6 @@ impl GooseAcpAgent {
         };
 
         let agent = self.get_session_agent(&session_id).await?;
-        agent.start_deferred_extensions(&session_id).await;
         let mut apps = fetch_mcp_apps(&agent.extension_manager, &session_id)
             .await
             .map_err(|error| {

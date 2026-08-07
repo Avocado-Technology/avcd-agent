@@ -583,13 +583,6 @@ pub trait Provider: Send + Sync {
         false
     }
 
-    /// Whether the provider forwards stdio/streamable-HTTP extensions to a
-    /// downstream session that runs its own MCP server instances. When true,
-    /// goose defers spawning local clients until a goose-side consumer needs them.
-    fn forwards_extensions_downstream(&self) -> bool {
-        false
-    }
-
     fn set_session_title_callback(&self, _callback: Arc<dyn Fn(String) + Send + Sync>) {}
 
     /// Configure OAuth authentication for this provider

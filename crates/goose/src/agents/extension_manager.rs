@@ -188,9 +188,6 @@ pub(crate) const TRUSTED_TOOL_UPDATE_META_KEY: &str = "__goose_tool_update_meta"
 /// Manages goose extensions / MCP clients and their interactions
 pub struct ExtensionManager {
     extensions: Mutex<HashMap<String, Extension>>,
-    /// Part of the session's extension set, but with no local MCP client
-    /// because the provider runs them in a downstream session.
-    deferred_extensions: Mutex<HashMap<String, ExtensionConfig>>,
     context: PlatformExtensionContext,
     provider: SharedProvider,
     tools_cache: Mutex<Option<Arc<Vec<Tool>>>>,
@@ -902,7 +899,6 @@ impl ExtensionManager {
     ) -> Self {
         Self {
             extensions: Mutex::new(HashMap::new()),
-            deferred_extensions: Mutex::new(HashMap::new()),
             context: PlatformExtensionContext {
                 extension_manager: None,
                 session_manager,
@@ -949,97 +945,8 @@ impl ExtensionManager {
 
     /// Add an extension with an optional working directory.
     /// If working_dir is None, falls back to current_dir.
-    ///
-    /// When the provider forwards extensions downstream, forwardable configs
-    /// are held as deferred instead of spawned: the downstream harness runs
-    /// its own instances and goose-side tools are never shown to the model.
-    pub async fn add_extension(
-        self: &Arc<Self>,
-        config: ExtensionConfig,
-        working_dir: Option<PathBuf>,
-        container: Option<&Container>,
-        session_id: Option<&str>,
-    ) -> ExtensionResult<()> {
-        if self.should_defer_local_spawn(&config).await {
-            let key = config.key();
-            if !self.extensions.lock().await.contains_key(&key) {
-                self.deferred_extensions.lock().await.insert(key, config);
-                return Ok(());
-            }
-        }
-        self.spawn_extension(config, working_dir, container, session_id)
-            .await
-    }
-
-    fn is_forwardable(config: &ExtensionConfig) -> bool {
-        matches!(
-            config,
-            ExtensionConfig::Stdio { .. } | ExtensionConfig::StreamableHttp { .. }
-        )
-    }
-
-    async fn should_defer_local_spawn(&self, config: &ExtensionConfig) -> bool {
-        if !Self::is_forwardable(config) {
-            return false;
-        }
-        let provider = self.provider.lock().await.clone();
-        provider.is_some_and(|provider| provider.forwards_extensions_downstream())
-    }
-
-    /// Return forwardable extensions to the deferred set, shutting down local
-    /// clients that would duplicate the downstream harness's own instances.
-    pub async fn defer_forwardable_extensions(&self) {
-        let mut extensions = self.extensions.lock().await;
-        let keys: Vec<String> = extensions
-            .iter()
-            .filter(|(_, extension)| Self::is_forwardable(&extension.config))
-            .map(|(key, _)| key.clone())
-            .collect();
-        if keys.is_empty() {
-            return;
-        }
-        let mut deferred = self.deferred_extensions.lock().await;
-        for key in keys {
-            if let Some(extension) = extensions.remove(&key) {
-                deferred.insert(key, extension.config);
-            }
-        }
-        drop(deferred);
-        drop(extensions);
-        self.invalidate_tools_cache_and_bump_version().await;
-    }
-
-    /// Spawn deferred extensions for goose-side consumers that need local
-    /// instances. Failed spawns return to the deferred set for retry.
-    pub async fn start_deferred_extensions(
-        self: &Arc<Self>,
-        working_dir: Option<PathBuf>,
-        container: Option<&Container>,
-        session_id: Option<&str>,
-    ) {
-        let deferred: Vec<(String, ExtensionConfig)> =
-            self.deferred_extensions.lock().await.drain().collect();
-        let spawns = deferred.into_iter().map(|(key, config)| {
-            let working_dir = working_dir.clone();
-            async move {
-                if let Err(error) = self
-                    .spawn_extension(config.clone(), working_dir, container, session_id)
-                    .await
-                {
-                    tracing::warn!(extension = %key, %error, "failed to start deferred extension");
-                    self.deferred_extensions.lock().await.insert(key, config);
-                }
-            }
-        });
-        futures::future::join_all(spawns).await;
-    }
-
-    pub async fn has_deferred_extensions(&self) -> bool {
-        !self.deferred_extensions.lock().await.is_empty()
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn spawn_extension(
+    pub async fn add_extension(
         self: &Arc<Self>,
         config: ExtensionConfig,
         working_dir: Option<PathBuf>,
@@ -1291,10 +1198,6 @@ impl ExtensionManager {
 
         let server_info = client.get_info().cloned();
 
-        self.deferred_extensions
-            .lock()
-            .await
-            .remove(&sanitized_name);
         let mut extensions = self.extensions.lock().await;
         extensions.insert(
             sanitized_name,
@@ -1347,10 +1250,6 @@ impl ExtensionManager {
     pub async fn remove_extension(&self, name: &str) -> ExtensionResult<()> {
         let sanitized_name = name_to_key(name);
         self.extensions.lock().await.remove(&sanitized_name);
-        self.deferred_extensions
-            .lock()
-            .await
-            .remove(&sanitized_name);
         self.invalidate_tools_cache_and_bump_version().await;
         Ok(())
     }
@@ -1377,31 +1276,21 @@ impl ExtensionManager {
     }
 
     pub async fn list_extensions(&self) -> ExtensionResult<Vec<String>> {
-        let mut names: Vec<String> = self.extensions.lock().await.keys().cloned().collect();
-        names.extend(self.deferred_extensions.lock().await.keys().cloned());
-        Ok(names)
+        Ok(self.extensions.lock().await.keys().cloned().collect())
     }
 
     pub async fn is_extension_enabled(&self, name: &str) -> bool {
         let normalized = name_to_key(name);
         self.extensions.lock().await.contains_key(&normalized)
-            || self
-                .deferred_extensions
-                .lock()
-                .await
-                .contains_key(&normalized)
     }
 
     pub async fn get_extension_configs(&self) -> Vec<ExtensionConfig> {
-        let mut configs: Vec<ExtensionConfig> = self
-            .extensions
+        self.extensions
             .lock()
             .await
             .values()
             .map(|ext| ext.config.clone())
-            .collect();
-        configs.extend(self.deferred_extensions.lock().await.values().cloned());
-        configs
+            .collect()
     }
 
     /// Get all tools from all clients with proper prefixing
@@ -2269,27 +2158,6 @@ impl ExtensionManager {
             }
         }
         parts
-    }
-}
-
-#[cfg(test)]
-impl ExtensionManager {
-    pub(crate) async fn defer_extension_for_tests(&self, config: ExtensionConfig) {
-        self.deferred_extensions
-            .lock()
-            .await
-            .insert(config.key(), config);
-    }
-
-    pub(crate) async fn insert_extension_for_tests(
-        &self,
-        config: ExtensionConfig,
-        client: McpClientBox,
-    ) {
-        let key = config.key();
-        let extension = Extension::new(config.clone(), config, client, None, None);
-        self.extensions.lock().await.insert(key, extension);
-        self.invalidate_tools_cache_and_bump_version().await;
     }
 }
 
@@ -3671,165 +3539,5 @@ mod tests {
             header_found,
             "custom header x-api-key was not forwarded through the OAuth connection path"
         );
-    }
-
-    struct ForwardingProvider;
-
-    #[async_trait::async_trait]
-    impl crate::providers::base::Provider for ForwardingProvider {
-        fn get_name(&self) -> &str {
-            "forwarding-mock"
-        }
-
-        async fn stream(
-            &self,
-            _model_config: &goose_providers::model::ModelConfig,
-            _system: &str,
-            _messages: &[crate::conversation::message::Message],
-            _tools: &[Tool],
-        ) -> Result<crate::providers::base::MessageStream, goose_providers::errors::ProviderError>
-        {
-            Err(goose_providers::errors::ProviderError::ExecutionError(
-                "not used in this test".to_string(),
-            ))
-        }
-
-        fn forwards_extensions_downstream(&self) -> bool {
-            true
-        }
-    }
-
-    #[tokio::test]
-    async fn test_stdio_extension_deferred_for_forwarding_provider() {
-        let temp_dir = tempdir().unwrap();
-        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
-            temp_dir.path().to_path_buf(),
-        ));
-        *extension_manager.provider.lock().await = Some(Arc::new(ForwardingProvider));
-
-        let config = ExtensionConfig::stdio(
-            "deferred_ext",
-            "nonexistent-binary-for-deferral-test",
-            "test extension",
-            5u64,
-        );
-
-        extension_manager
-            .add_extension(config.clone(), None, None, None)
-            .await
-            .expect("deferred add should not spawn and should succeed");
-
-        assert!(
-            extension_manager.extensions.lock().await.is_empty(),
-            "no local MCP client should be spawned for a forwarding provider"
-        );
-        assert!(extension_manager.has_deferred_extensions().await);
-        assert!(extension_manager.is_extension_enabled("deferred_ext").await);
-        assert_eq!(
-            extension_manager.get_extension_configs().await,
-            vec![config]
-        );
-        assert_eq!(
-            extension_manager.list_extensions().await.unwrap(),
-            vec!["deferred_ext".to_string()],
-            "the extension listing must agree with enablement checks"
-        );
-
-        extension_manager
-            .remove_extension("deferred_ext")
-            .await
-            .unwrap();
-        assert!(!extension_manager.has_deferred_extensions().await);
-        assert!(!extension_manager.is_extension_enabled("deferred_ext").await);
-        assert!(extension_manager.get_extension_configs().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_builtin_extension_not_deferred_for_forwarding_provider() {
-        let temp_dir = tempdir().unwrap();
-        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
-            temp_dir.path().to_path_buf(),
-        ));
-        *extension_manager.provider.lock().await = Some(Arc::new(ForwardingProvider));
-
-        let config = ExtensionConfig::Builtin {
-            name: "todo".to_string(),
-            display_name: None,
-            description: "built-in".to_string(),
-            timeout: None,
-            bundled: None,
-            available_tools: vec![],
-        };
-        assert!(!extension_manager.should_defer_local_spawn(&config).await);
-    }
-
-    #[tokio::test]
-    async fn test_start_deferred_extensions_attempts_spawn_and_keeps_failed() {
-        let temp_dir = tempdir().unwrap();
-        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
-            temp_dir.path().to_path_buf(),
-        ));
-        *extension_manager.provider.lock().await = Some(Arc::new(ForwardingProvider));
-
-        let config = ExtensionConfig::stdio(
-            "deferred_ext",
-            "nonexistent-binary-for-deferral-test",
-            "test extension",
-            5u64,
-        );
-        extension_manager
-            .add_extension(config, None, None, None)
-            .await
-            .unwrap();
-        assert!(extension_manager.has_deferred_extensions().await);
-
-        extension_manager
-            .start_deferred_extensions(None, None, None)
-            .await;
-
-        assert!(
-            extension_manager.extensions.lock().await.is_empty(),
-            "spawn of a nonexistent binary must not register an extension"
-        );
-        assert!(
-            extension_manager.has_deferred_extensions().await,
-            "failed spawns should stay deferred so a later consumer can retry"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_defer_forwardable_extensions_redefers_stdio_and_keeps_builtin() {
-        let temp_dir = tempdir().unwrap();
-        let extension_manager = Arc::new(ExtensionManager::new_without_provider(
-            temp_dir.path().to_path_buf(),
-        ));
-
-        let stdio_config =
-            ExtensionConfig::stdio("local_ext", "some-command", "test extension", 5u64);
-        extension_manager
-            .insert_extension_for_tests(stdio_config.clone(), Arc::new(MockClient {}))
-            .await;
-        extension_manager
-            .add_mock_extension("builtin_ext".to_string(), Arc::new(MockClient {}))
-            .await;
-
-        extension_manager.defer_forwardable_extensions().await;
-
-        let extensions = extension_manager.extensions.lock().await;
-        assert!(
-            !extensions.contains_key("local_ext"),
-            "the local stdio client must be shut down"
-        );
-        assert!(
-            extensions.contains_key("builtin_ext"),
-            "in-process extensions must keep running"
-        );
-        drop(extensions);
-        assert!(extension_manager.has_deferred_extensions().await);
-        assert!(extension_manager.is_extension_enabled("local_ext").await);
-        assert!(extension_manager
-            .get_extension_configs()
-            .await
-            .contains(&stdio_config));
     }
 }
