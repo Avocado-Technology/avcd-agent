@@ -188,9 +188,8 @@ pub(crate) const TRUSTED_TOOL_UPDATE_META_KEY: &str = "__goose_tool_update_meta"
 /// Manages goose extensions / MCP clients and their interactions
 pub struct ExtensionManager {
     extensions: Mutex<HashMap<String, Extension>>,
-    /// Extensions that are part of the session's extension set but whose
-    /// local MCP client was not spawned because the provider runs them in a
-    /// downstream session. See `add_extension`.
+    /// Part of the session's extension set, but with no local MCP client
+    /// because the provider runs them in a downstream session.
     deferred_extensions: Mutex<HashMap<String, ExtensionConfig>>,
     context: PlatformExtensionContext,
     provider: SharedProvider,
@@ -951,13 +950,9 @@ impl ExtensionManager {
     /// Add an extension with an optional working directory.
     /// If working_dir is None, falls back to current_dir.
     ///
-    /// When the session's provider forwards extensions to a downstream session
-    /// (see `Provider::forwards_extensions_downstream`), stdio and
-    /// streamable-HTTP extensions are not spawned locally: the downstream
-    /// harness runs its own instances and goose-side tools are never shown to
-    /// the model. The config is kept as deferred so it stays part of the
-    /// session's extension set and can be spawned later via
-    /// `start_deferred_extensions`.
+    /// When the provider forwards extensions downstream, forwardable configs
+    /// are held as deferred instead of spawned: the downstream harness runs
+    /// its own instances and goose-side tools are never shown to the model.
     pub async fn add_extension(
         self: &Arc<Self>,
         config: ExtensionConfig,
@@ -991,11 +986,8 @@ impl ExtensionManager {
         provider.is_some_and(|provider| provider.forwards_extensions_downstream())
     }
 
-    /// Shut down local MCP clients for extensions that the session's provider
-    /// runs in a downstream session, keeping their configs deferred so
-    /// goose-side consumers can respawn them on demand. Called on a switch to
-    /// a forwarding provider so local clients don't duplicate the downstream
-    /// harness's own instances.
+    /// Return forwardable extensions to the deferred set, shutting down local
+    /// clients that would duplicate the downstream harness's own instances.
     pub async fn defer_forwardable_extensions(&self) {
         let mut extensions = self.extensions.lock().await;
         let keys: Vec<String> = extensions
@@ -1017,10 +1009,8 @@ impl ExtensionManager {
         self.invalidate_tools_cache_and_bump_version().await;
     }
 
-    /// Spawn extensions whose local start was deferred because the session's
-    /// provider runs them in a downstream session. Called when a goose-side
-    /// consumer (client tool listing/calls, resources, apps, or a switch to a
-    /// provider that dispatches tools through goose) needs local instances.
+    /// Spawn deferred extensions for goose-side consumers that need local
+    /// instances. Failed spawns return to the deferred set for retry.
     pub async fn start_deferred_extensions(
         self: &Arc<Self>,
         working_dir: Option<PathBuf>,

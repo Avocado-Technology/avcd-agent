@@ -584,10 +584,8 @@ pub trait Provider: Send + Sync {
     }
 
     /// Whether the provider forwards stdio/streamable-HTTP extensions to a
-    /// downstream session that runs its own MCP server instances and ignores
-    /// goose-side tools (e.g. ACP harness adapters). When true, goose defers
-    /// spawning local MCP clients for those extensions until a goose-side
-    /// consumer needs them.
+    /// downstream session that runs its own MCP server instances. When true,
+    /// goose defers spawning local clients until a goose-side consumer needs them.
     fn forwards_extensions_downstream(&self) -> bool {
         false
     }

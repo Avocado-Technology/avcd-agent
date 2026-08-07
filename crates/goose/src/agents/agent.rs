@@ -1555,10 +1555,8 @@ impl Agent {
         prefixed_tools
     }
 
-    /// Spawn any session extensions whose local start was deferred because
-    /// the provider runs them in a downstream session (see
-    /// `Provider::forwards_extensions_downstream`). Used by surfaces that
-    /// serve goose-side tools, prompts, and resources to clients.
+    /// Spawn extensions whose local start was deferred because the provider
+    /// runs them downstream (see `Provider::forwards_extensions_downstream`).
     pub async fn start_deferred_extensions(&self, session_id: &str) {
         if !self.extension_manager.has_deferred_extensions().await {
             return;
